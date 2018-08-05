@@ -1,0 +1,179 @@
+---
+title: "A Text-Based Network"
+#output: html_notebook
+output: rmarkdown::github_document
+#  pdf_document: default
+# output:
+#   html_notebook: default
+#   pdf_document: default
+author: Majeed Simaan
+date: August 5, 2018
+---
+<!-- <style> -->
+<!-- .main-container { -->
+<!--   max-width: none;!important -->
+<!--   max-height: none;!important -->
+<!--   margin-left: auto;!important -->
+<!--   margin-right: auto;!important -->
+<!-- } -->
+<!-- </style> -->
+
+
+### Introduction
+Most network studies in finance deploy quantitative data to assess the interconnectedness among firms. A common approach relies on stock data to assess the co-movement across stock prices - known as correlation-based networks. Another common approach relies on cross holdings (transactions) among entities. These interactions, hence, determine the degree of interconnectedness of firms in the system.  In this vignette, I will demonstrate a simple approach to identify network structure across companies using publicly available textual data.  
+
+### Getting Started
+To get started, I use a number of packages. The `stringdist` will be used to construct a similarity metric that proxies the degree to which two documents are related. I refer to `rvest` package that makes parsing web data so intuitive and simple. I also rely on the `tm` package to do some text cleaning. Finally, I rely on two packages, `igraph` and `visNetwork`, for network visualization. 
+```{r message=FALSE, warning=FALSE}
+library(stringdist)
+library(rvest)
+library(tm)
+library(igraph)
+library(visNetwork)
+```
+
+I look at the 12 different tickers from 6 different industries: Financials, Technology, Health, Utility, Energy, and Consumer Non-Durable.
+```{r}
+tics <- c("JPM","BAC","GOOG","AAPL","MMM","AAC","T","VZ","XOM","CVX","KO","BUD")
+```
+
+Using the `rvest` I parse the profile of each ticker from Yahoo Finance using the following function:
+```{r}
+read_profile <- function(tic) {
+  theurl <- paste("https://finance.yahoo.com/quote/",tic,"/profile?p=",tic,sep = "")
+  file1 <- read_html(theurl)
+  text1 <- file1 %>%
+    html_nodes("section") %>%
+    html_text()
+  
+  text1 <- text1[grep("description",text1,ignore.case = T)]
+  text1 <- text1[2]
+
+  return(text1)
+  }
+```
+In case you are not familiar with `rvest`, check this [link](https://blog.rstudio.com/2014/11/24/rvest-easy-web-scraping-with-r/), for a brief introduction. 
+
+I run the `read_profile` over each ticker:
+```{r}
+profile.list <- lapply(tics, read_profile)
+names(profile.list) <- tics
+```
+In NLP context, the `profile.list` is known as the corpus, i.e. the list of all documents. Using the `tm` package, users can utilize a number of functions for text cleaning and stemming. In this case, I transform the documents into lower case and drop stop-words, punctuations, and numbers.
+```{r}
+profile.list <- lapply(profile.list,tolower)
+profile.list <- lapply(profile.list,function(x) removeWords(x, stopwords("english")) )
+profile.list <- lapply(profile.list,removePunctuation)
+profile.list <- lapply(profile.list,removeNumbers)
+
+```
+For instance, I can look at the unique number of words in each document: 
+```{r}
+words_u <- lapply(profile.list, function(x) unique(unlist(strsplit(x, " "))) )
+words_u <- lapply(words_u, function(x) x[nchar(x)>0] )
+```
+Given the `words_u` list, I can count the overlapping words between each pair of firms. For instance, looking at the two banks JPM and BAC, we have a large list of overlapping words:
+```{r}
+intersect(words_u$JPM,words_u$BAC)
+```
+Whereas, if we were to compare between JPM and BUD, we find only a few common words, which are related to the establishment of the company rather than the business model:
+```{r}
+intersect(words_u$JPM,words_u$BUD)
+```
+
+### Fuzzy Matching
+To quantify the above, one can count the overlapping words among the companies. However, this approach is either "hit or miss". To get a more robust perspective, I will use a "fuzzy" matching approach to approximate the similarity (distance) between two given documents.
+
+Specifically, I will refer to the `stringdist` package that computes the distance between two strings, `s1` and `s2`. To demonstrate this, I provide the following example:
+```{r}
+s1 <- "Majeed loves R programming"
+s2 <- "Majeed loves Sichuan food"
+stringdist(s1,s2,method = "jw")
+```
+The `stringdist` takes two arguments as the strings to be compared, whereas the third argument determines the method. In this illustration, I use the Jaro–Winkler (JW) distance algorithm that returns a score between 0 and 1. If two strings are identical, the result is zero. If there is no overlap at all between the two strings, then the function returns 1. Comparing between `s1` and `s2`, we observe that the score is around 0.24, whereas when we compare between `s1` and `s3`, we get a lower score:
+
+```{r}
+s3 <- "Majeed loves food"
+stringdist(s1,s3,method = "jw")
+```
+While `s2` and `s3` are related to food than programming, the latter has a smaller number of characters that mismatches the first string. The larger the string is, the more likely to find similarities as well as dissimilarities between the two. 
+
+ 
+### Text-Based Network
+Given the above illustration, I will demonstrate how to use the JW algorithm to define a text-based network as follows. First, to define a network, I need to compute the adjacency matrix. In our case, the adjacency matrix will denote the similarity between the companies. If we have $n$ firms, we need to compute $\frac{n\times(n-1)}{2}$ similarity measures. To move forward, let us consider all possible permutations using the tickers we have
+
+```{r}
+M <- data.frame(t(combn(tics,2)))
+dim(M)
+```
+In our case, there are 66 matches, i.e. $12\times11 \div 2$. For each combo, I will compute the distance between the two using the JW algorithm:
+```{r}
+M$D <- apply(M,1,function(x) stringdist(profile.list[[x[1]]],profile.list[[x[2]]],method = "jw")   )
+head(M,11)
+```
+Not surprisingly, we observe that the smallest distance for JPM  is BAC, whereas the largest distance  is when compared with BUD. 
+
+I define the adjacency matrix using the distance `D`. To do so, I do the following steps:
+```{r}
+n <- length(tics)
+W <- matrix(NA,n,n)
+rownames(W) <- colnames(W) <- tics
+W[lower.tri(W)] <- M$D
+W[upper.tri(W)] <- t(W)[upper.tri(W)]
+```
+Second, I use a cutoff point to identify significant links among firms. In this case, I use an arbitrary choice of 0.25 as the cutoff point. Additionally, I transform  the distance into similarity score using a logit transformation:
+```{r}
+W[W > 0.25] <- NA
+logit <- function(p) log(p)/log(1-p)
+W <- logit(W)
+W[is.na(W)] <- 0
+data.frame(W)
+```
+We see that BUD has no neighbors as its column indicates. 
+
+Finally, given the adjacency matrix `W`, I can produce a network graph using the following commands (see this [link]("http://kateto.net/network-visualization") by Katya Ognyanova, for an excellent summary on static and dynamic network visualization)
+```{r}
+WW=graph.adjacency(W,diag=TRUE,weighted = TRUE,mode = "undirected" ) 
+data <- toVisNetworkData(WW)
+
+# get the edges/links
+vis.links <- data$edges
+vis.links$value <- log(vis.links$weight)
+
+# get the nodes
+vis.nodes <- data$nodes
+vis.nodes$label  <- vis.nodes$label 
+vis.nodes$font.size  <-30
+vis.nodes$font.color <- "black"
+
+# add 6 different colors to highlight industries
+pal <- colorRampPalette(c("yellow","blue"))
+cols <- sort(rep(pal(n/2),2))
+vis.nodes$color.background <- cols
+vis.nodes$color.border <- "black"
+vis.nodes$color.highlight.border <- "darkred"
+
+# finally, visualize the network
+Net <- visNetwork(vis.nodes, vis.links) %>%
+  visOptions(highlightNearest = T) %>%
+  visLayout(randomSeed = 11)  %>% 
+  visPhysics(stabilization = FALSE)
+  # %>% visIgraphLayout(layout = "layout_with_fr")
+Net %>% visSave(file = "Net.html")
+```
+
+I refer to the `visNetwork` to construct an interactive network. However, I also utilize the commands from `igraph` to derive the adjacency matrix, which I feed into the former. Finally, I save the `visNetwork` as `Net` into a HTML file to control its location and size. I load the network using the `htmltools` package: 
+```{r}
+htmltools::includeHTML("Net.html")
+```
+
+The above network is dynamic, allowing users to highlight  different nodes and clusters. The thickness of the edge between the nodes indicates the similarity level between the firms. For instance, we see that the thickest edge is the one between JPM and BAC. The colors of the nodes indicate the industry that the firms belong to. In most cases, we observe that companies in the same industry form a network, except the case for Google and Apple as well as Budweiser, which seems to be isolated from all other firms. 
+
+
+### Summary
+This vignette provides a simple illustration on how to quantify textual data and, hence, form text-based network. The approach taken here can be generalized using other advanced text mining techniques(see e.g.,  **word2vec**). Additionally, users can refer to richer sources of textual data, such as SEC EDGAR, to gain a more detailed perspective on companies' business models.
+
+
+*** 
+[Email](msimaan@stevens.edu) | [Linkedin](https://www.linkedin.com/in/majeed-simaan-85383045) | [Github](https://github.com/simaan84)
+
